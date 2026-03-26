@@ -1,28 +1,24 @@
 """
-Score each occupation's AI exposure using an LLM via OpenRouter.
+Score each occupation's AI exposure using Claude via the claude CLI.
 
-Reads Markdown descriptions from pages/, sends each to an LLM with a scoring
+Reads Markdown descriptions from pages/, sends each to Claude with a scoring
 rubric, and collects structured scores. Results are cached incrementally to
 scores.json so the script can be resumed if interrupted.
 
+Uses the `claude` CLI for authentication (no API key needed).
+
 Usage:
     uv run python score.py
-    uv run python score.py --model google/gemini-3-flash-preview
     uv run python score.py --start 0 --end 10   # test on first 10
 """
 
 import argparse
 import json
 import os
+import subprocess
 import time
-import httpx
-from dotenv import load_dotenv
 
-load_dotenv()
-
-DEFAULT_MODEL = "google/gemini-3-flash-preview"
 OUTPUT_FILE = "scores.json"
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 SYSTEM_PROMPT = """\
 You are an expert analyst evaluating how exposed different occupations are to \
@@ -85,28 +81,23 @@ Respond with ONLY a JSON object in this exact format, no other text:
 """
 
 
-def score_occupation(client, text, model):
-    """Send one occupation to the LLM and parse the structured response."""
-    response = client.post(
-        API_URL,
-        headers={
-            "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
-        },
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            "temperature": 0.2,
-        },
-        timeout=60,
+def score_occupation(text):
+    """Send one occupation to Claude CLI and parse the structured response."""
+    prompt = f"{SYSTEM_PROMPT}\n\n---\n\n{text}"
+
+    result = subprocess.run(
+        ["claude", "-p", "--model", "haiku", prompt],
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
-    response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
+
+    if result.returncode != 0:
+        raise RuntimeError(f"claude CLI failed: {result.stderr.strip()}")
+
+    content = result.stdout.strip()
 
     # Strip markdown code fences if present
-    content = content.strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[1]  # remove first line
         if content.endswith("```"):
@@ -118,7 +109,6 @@ def score_occupation(client, text, model):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=None)
     parser.add_argument("--delay", type=float, default=0.5)
@@ -138,11 +128,10 @@ def main():
             for entry in json.load(f):
                 scores[entry["slug"]] = entry
 
-    print(f"Scoring {len(subset)} occupations with {args.model}")
+    print(f"Scoring {len(subset)} occupations with Claude (haiku via CLI)")
     print(f"Already cached: {len(scores)}")
 
     errors = []
-    client = httpx.Client()
 
     for i, occ in enumerate(subset):
         slug = occ["slug"]
@@ -161,7 +150,7 @@ def main():
         print(f"  [{i+1}/{len(subset)}] {occ['title']}...", end=" ", flush=True)
 
         try:
-            result = score_occupation(client, text, args.model)
+            result = score_occupation(text)
             scores[slug] = {
                 "slug": slug,
                 "title": occ["title"],
@@ -178,8 +167,6 @@ def main():
 
         if i < len(subset) - 1:
             time.sleep(args.delay)
-
-    client.close()
 
     print(f"\nDone. Scored {len(scores)} occupations, {len(errors)} errors.")
     if errors:
